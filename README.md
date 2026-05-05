@@ -1,40 +1,33 @@
 # NEAR Testnet Deploy
 
-Automatically deploy smart contracts to NEAR testnet with account creation, faucet funding, and smoke test execution in a single step.
+GitHub Action for deploying smart contracts to NEAR testnet with automatic account creation, faucet funding, and smoke test execution.
 
 ## Description
 
-This action handles the complete NEAR testnet deployment workflow. It creates a testnet account if one does not exist, requests faucet funding, deploys your contract, runs basic smoke tests, and reports the results back to your workflow.
+Handles the complete NEAR testnet deployment workflow in a single step. Automatically creates a testnet account if one does not exist, requests faucet funding, deploys your contract, runs basic smoke tests, and reports the results.
 
 ## Inputs
 
-| Name | Required | Default | Description |
-|------|----------|---------|-------------|
+| Input | Required | Default | Description |
+|---|---|---|---|
 | `account-id` | Yes | — | NEAR testnet account ID to deploy to |
 | `contract-path` | Yes | — | Path to the compiled `.wasm` contract file |
-| `private-key` | Yes | — | Private key for the deploying account |
-| `faucet-amount` | No | `10` | Amount of NEAR tokens to request from faucet |
-| `smoke-test-methods` | No | `""` | Comma-separated list of view methods to call after deploy |
+| `private-key` | No | — | Account private key; auto-generated if omitted |
+| `faucet-amount` | No | `10` | Amount of NEAR to request from faucet |
+| `smoke-test-methods` | No | — | Comma-separated list of view methods to call after deploy |
 | `network` | No | `testnet` | NEAR network RPC target |
 
 ## Outputs
 
-| Name | Description |
-|------|-------------|
+| Output | Description |
+|---|---|
 | `account-id` | The testnet account used for deployment |
-| `transaction-hash` | Transaction hash of the deployment |
-| `contract-balance` | Account balance after faucet funding |
+| `contract-hash` | SHA256 hash of the deployed contract |
+| `transaction-id` | Deploy transaction ID on testnet |
 | `smoke-test-results` | JSON string containing smoke test call results |
-| `deployment-status` | Final status: `success` or `failure` |
+| `funded` | `true` if faucet funding was requested |
 
 ## Usage
-
-name: Deploy to Testnet
-
-on:
-  push:
-    branches:
-      - main
 
 jobs:
   deploy:
@@ -46,9 +39,15 @@ jobs:
         run: cargo build --target wasm32-unknown-unknown --release
 
       - name: Deploy to NEAR Testnet
+        id: deploy
         uses: your-org/near-testnet-deploy@v1
         with:
-          account-id: mycontract.testnet
+          account-id: myapp.testnet
           contract-path: target/wasm32-unknown-unknown/release/contract.wasm
           private-key: ${{ secrets.NEAR_PRIVATE_KEY }}
           smoke-test-methods: get_status,get_owner
+
+      - name: Print results
+        run: |
+          echo "Deployed to ${{ steps.deploy.outputs.account-id }}"
+          echo "TX: ${{ steps.deploy.outputs.transaction-id }}"
