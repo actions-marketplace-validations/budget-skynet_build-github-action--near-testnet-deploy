@@ -6,26 +6,26 @@ inputs:
     description: "Path to the NEAR contract directory or compiled WASM file"
     required: true
     default: ''
-  testnet_account_id:
+  account_id:
     description: "NEAR testnet account ID for deployment"
     required: true
     default: ''
-  testnet_private_key:
-    description: "Private key for testnet account authentication"
+  private_key:
+    description: "Private key for NEAR testnet account (stored as secret)"
     required: true
     default: ''
-  faucet_funding_amount:
-    description: "Amount of NEAR tokens to request from faucet in tokens"
+  faucet_amount:
+    description: "Amount of NEAR tokens to request from testnet faucet"
     required: false
-    default: '10'
-  smoke_tests_path:
-    description: "Path to smoke test files to execute after deployment"
+    default: '100'
+  test_command:
+    description: "Command to run smoke tests after deployment"
     required: false
-    default: 'tests/'
-  auto_create_account:
-    description: "Automatically create testnet account if it doesn't exist"
+    default: 'npm test'
+  network:
+    description: "NEAR network to deploy to (testnet or custom RPC URL)"
     required: false
-    default: 'true'
+    default: 'testnet'
 
 outputs:
   result:
@@ -49,8 +49,8 @@ runs:
       run: cd ${{ github.action_path }} && node src/index.js
       env:
         INPUT_CONTRACT_PATH: ${{ inputs.contract_path }}
-        INPUT_TESTNET_ACCOUNT_ID: ${{ inputs.testnet_account_id }}
-        INPUT_TESTNET_PRIVATE_KEY: ${{ inputs.testnet_private_key }}
-        INPUT_FAUCET_FUNDING_AMOUNT: ${{ inputs.faucet_funding_amount }}
-        INPUT_SMOKE_TESTS_PATH: ${{ inputs.smoke_tests_path }}
-        INPUT_AUTO_CREATE_ACCOUNT: ${{ inputs.auto_create_account }}
+        INPUT_ACCOUNT_ID: ${{ inputs.account_id }}
+        INPUT_PRIVATE_KEY: ${{ inputs.private_key }}
+        INPUT_FAUCET_AMOUNT: ${{ inputs.faucet_amount }}
+        INPUT_TEST_COMMAND: ${{ inputs.test_command }}
+        INPUT_NETWORK: ${{ inputs.network }}
