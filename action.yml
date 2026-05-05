@@ -54,3 +54,7 @@ runs:
         INPUT_FAUCET_AMOUNT: ${{ inputs.faucet_amount }}
         INPUT_TEST_COMMAND: ${{ inputs.test_command }}
         INPUT_NEAR_CLI_VERSION: ${{ inputs.near_cli_version }}
+
+branding:
+  icon: 'upload-cloud'
+  color: 'blue'
