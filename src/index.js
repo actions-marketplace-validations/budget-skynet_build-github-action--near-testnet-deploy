@@ -1,460 +1,556 @@
-async function checkOrCreateAccount(accountId, privateKey, network) {
-  core.startGroup('Step 1: Check / Create Testnet Account');
-  core.info(`Checking if account "${accountId}" exists on ${network}...`);
-
-  let accountExists = false;
-
+async function nearRpc(method, params) {
+  const RPC_URL = 'https://rpc.testnet.near.org';
+  const body = { jsonrpc: '2.0', id: 'action', method, params };
+  const res = await request(RPC_URL, { method: 'POST' }, body);
+  let parsed;
   try {
-    const response = await nearRpcCall(network, 'query', {
-      request_type: 'view_account',
-      finality: 'final',
-      account_id: accountId,
-    });
-
-    if (response.body && response.body.result && response.body.result.code_hash) {
-      core.info(`✅ Account "${accountId}" already exists.`);
-      core.info(`   Balance: ${(BigInt(response.body.result.amount) / BigInt('1000000000000000000000000')).toString()} NEAR`);
-      accountExists = true;
-    } else if (response.body && response.body.error) {
-      const errName = response.body.error.cause ? response.body.error.cause.name : '';
-      if (errName === 'UNKNOWN_ACCOUNT' || response.body.error.name === 'HANDLER_ERROR') {
-        core.info(`Account "${accountId}" does not exist. Will attempt to create it via wallet API.`);
-        accountExists = false;
-      } else {
-        core.warning(`Unexpected RPC error: ${JSON.stringify(response.body.error)}`);
-        accountExists = false;
-      }
-    }
-  } catch (err) {
-    core.warning(`RPC check failed: ${err.message}. Assuming account does not exist.`);
-    accountExists = false;
+    parsed = JSON.parse(res.body);
+  } catch (e) {
+    throw new Error(`Failed to parse RPC response: ${res.body}`);
   }
-
-  if (!accountExists) {
-    core.info(`Attempting to create testnet account "${accountId}"...`);
-
-    // Derive public key from private key using near-cli or key derivation
-    let publicKey;
-    try {
-      // Try using near-cli keypair derivation
-      const keyResult = execCommand(`node -e "
-        const { KeyPair } = require('near-api-js');
-        const keyPair = KeyPair.fromString('${privateKey}');
-        console.log(keyPair.getPublicKey().toString());
-      "`);
-
-      if (keyResult.success) {
-        publicKey = keyResult.output.trim();
-        core.info(`Derived public key: ${publicKey}`);
-      }
-    } catch {
-      core.warning('Could not derive public key from near-api-js, trying alternative...');
-    }
-
-    if (!publicKey) {
-      // Fallback: use ed25519 derivation if key starts with ed25519:
-      if (privateKey.startsWith('ed25519:')) {
-        const rawKey = privateKey.replace('ed25519:', '');
-        publicKey = `ed25519:${rawKey.substring(0, 44)}`; // approximation for logging
-      } else {
-        publicKey = privateKey; // last resort
-      }
-    }
-
-    // Use testnet helper API to create account
-    const helperBody = JSON.stringify({
-      newAccountId: accountId,
-      newAccountPublicKey: publicKey,
-    });
-
-    try {
-      const createResponse = await httpsRequest({
-        hostname: 'helper.testnet.near.org',
-        port: 443,
-        path: '/account',
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(helperBody),
-          'Referer': 'https://wallet.testnet.near.org',
-        },
-      }, helperBody);
-
-      if (createResponse.statusCode === 200 || createResponse.statusCode === 201) {
-        core.info(`✅ Account "${accountId}" created successfully via testnet helper.`);
-        accountExists = true;
-      } else {
-        core.warning(`Testnet helper response (${createResponse.statusCode}): ${JSON.stringify(createResponse.body)}`);
-        // Account might already exist or creation failed; proceed anyway
-        core.info('Proceeding — account may have been created or already exists.');
-        accountExists = true; // optimistically proceed
-      }
-    } catch (helperErr) {
-      core.warning(`Testnet helper request failed: ${helperErr.message}`);
-      core.info('Proceeding — will attempt deployment regardless.');
-      accountExists = true;
-    }
+  if (parsed.error) {
+    throw new Error(`RPC error [${method}]: ${JSON.stringify(parsed.error)}`);
   }
-
-  core.endGroup();
-  return { accountExists, accountId };
+  return parsed.result;
 }
 
-// ─── Step 2: Request Faucet Funding ──────────────────────────────────────────
-
-async function requestFaucetFunding(accountId, faucetAmount, network) {
-  core.startGroup('Step 2: Request Faucet Funding');
-  core.info(`Requesting ${faucetAmount} NEAR for "${accountId}" on ${network}...`);
-
-  let funded = false;
-  let balanceBefore = BigInt(0);
-  let balanceAfter = BigInt(0);
-
-  // Check current balance
+// ---------------------------------------------------------------------------
+// Utility: Derive Ed25519 public key from a private key (hex or base58)
+// Uses Node's built-in crypto via nacl-like manual approach, but we rely on
+// the tweetnacl package bundled in node_modules at action runtime.
+// ---------------------------------------------------------------------------
+function loadNacl() {
+  // tweetnacl must be in package.json dependencies
   try {
-    const balanceResp = await nearRpcCall(network, 'query', {
-      request_type: 'view_account',
-      finality: 'final',
-      account_id: accountId,
-    });
-
-    if (balanceResp.body && balanceResp.body.result) {
-      balanceBefore = BigInt(balanceResp.body.result.amount);
-      const balanceNEAR = Number(balanceBefore / BigInt('1000000000000000000000000'));
-      core.info(`Current balance: ~${balanceNEAR} NEAR`);
-
-      if (balanceNEAR >= parseInt(faucetAmount, 10) / 2) {
-        core.info(`Balance sufficient (${balanceNEAR} NEAR ≥ ${parseInt(faucetAmount, 10) / 2} NEAR). Skipping faucet.`);
-        funded = true;
-        core.endGroup();
-        return { funded, balanceBefore: balanceNEAR, balanceAfter: balanceNEAR };
-      }
-    }
-  } catch (err) {
-    core.warning(`Balance check failed: ${err.message}`);
+    return require('tweetnacl');
+  } catch (e) {
+    throw new Error(
+      'tweetnacl not found. Ensure tweetnacl is listed in package.json dependencies and node_modules is bundled.'
+    );
   }
+}
 
-  // Attempt faucet via testnet helper
-  const faucetBody = JSON.stringify({ account_id: accountId });
-
+function loadBs58() {
   try {
-    const faucetResp = await httpsRequest({
-      hostname: 'helper.testnet.near.org',
-      port: 443,
-      path: '/faucet/tokens',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(faucetBody),
-      },
-    }, faucetBody);
+    return require('bs58');
+  } catch (e) {
+    throw new Error(
+      'bs58 not found. Ensure bs58 is listed in package.json dependencies and node_modules is bundled.'
+    );
+  }
+}
 
-    core.info(`Faucet response (${faucetResp.statusCode}): ${JSON.stringify(faucetResp.body)}`);
+/**
+ * Parse a NEAR private key string in any supported format:
+ *  - "ed25519:<base58-encoded-64-byte-seed>"  (NEAR keystore format)
+ *  - raw hex string (64 hex chars = 32 bytes seed, or 128 hex chars = 64 bytes keypair)
+ *  - raw base58 string (32 or 64 byte seed)
+ *
+ * Returns a Uint8Array of 32 bytes (the seed / secret key scalar).
+ */
+function parsePrivateKeySeed(privateKeyStr) {
+  const bs58 = loadBs58();
 
-    if (faucetResp.statusCode === 200 || faucetResp.statusCode === 201) {
-      core.info('✅ Faucet request successful.');
-      funded = true;
-    } else {
-      core.warning(`Faucet returned ${faucetResp.statusCode}. Trying alternative faucet endpoint...`);
+  const trimmed = privateKeyStr.trim();
+
+  // Format: "ed25519:<base58>"
+  if (trimmed.startsWith('ed25519:')) {
+    const b58Part = trimmed.slice('ed25519:'.length);
+    const decoded = bs58.decode(b58Part);
+    // NEAR stores 64-byte keypair (seed || public) or just 32-byte seed
+    if (decoded.length === 64) {
+      return decoded.slice(0, 32); // first 32 bytes are the seed
     }
-  } catch (err) {
-    core.warning(`Primary faucet failed: ${err.message}`);
+    if (decoded.length === 32) {
+      return decoded;
+    }
+    throw new Error(
+      `Unexpected ed25519 key length after base58 decode: ${decoded.length}`
+    );
   }
 
-  // Alternative: try near-faucet.io or other community faucets
-  if (!funded) {
-    try {
-      const altBody = JSON.stringify({ accountId, amount: faucetAmount });
-      const altResp = await httpsRequest({
-        hostname: 'near-faucet.io',
-        port: 443,
-        path: '/api/faucet',
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(altBody),
-        },
-      }, altBody);
-
-      core.info(`Alternative faucet response (${altResp.statusCode}): ${JSON.stringify(altResp.body)}`);
-      if (altResp.statusCode === 200) {
-        core.info('✅ Alternative faucet request successful.');
-        funded = true;
-      }
-    } catch (altErr) {
-      core.warning(`Alternative faucet failed: ${altErr.message}`);
+  // Format: hex string
+  if (/^[0-9a-fA-F]+$/.test(trimmed)) {
+    if (trimmed.length === 64) {
+      // 32 bytes
+      return Buffer.from(trimmed, 'hex');
     }
+    if (trimmed.length === 128) {
+      // 64 bytes — take first 32 as seed
+      return Buffer.from(trimmed.slice(0, 64), 'hex');
+    }
+    throw new Error(`Unexpected hex private key length: ${trimmed.length} chars`);
   }
 
-  // Wait a moment then check new balance
-  if (funded) {
-    core.info('Waiting 5s for balance to update...');
-    await new Promise(r => setTimeout(r, 5000));
+  // Fallback: try raw base58
+  try {
+    const decoded = bs58.decode(trimmed);
+    if (decoded.length === 64) return decoded.slice(0, 32);
+    if (decoded.length === 32) return decoded;
+    throw new Error(`Unexpected base58 key length: ${decoded.length}`);
+  } catch (e) {
+    throw new Error(
+      `Cannot parse private key. Supported formats: "ed25519:<base58>", hex (64 or 128 chars), base58. Error: ${e.message}`
+    );
+  }
+}
 
+/**
+ * Derive Ed25519 public key from private key string.
+ * Returns the public key as a base58-encoded string (NEAR format: "ed25519:<base58>").
+ */
+function derivePublicKey(privateKeyStr) {
+  const nacl = loadNacl();
+  const bs58 = loadBs58();
+
+  const seed = parsePrivateKeySeed(privateKeyStr);
+  // nacl.sign.keyPair.fromSeed expects exactly 32 bytes
+  const seedBytes = new Uint8Array(seed.buffer, seed.byteOffset, 32);
+  const keyPair = nacl.sign.keyPair.fromSeed(seedBytes);
+  const publicKeyB58 = bs58.encode(Buffer.from(keyPair.publicKey));
+  return `ed25519:${publicKeyB58}`;
+}
+
+// ---------------------------------------------------------------------------
+// Utility: exec helper that streams output and throws on non-zero exit
+// ---------------------------------------------------------------------------
+function exec(cmd, options = {}) {
+  core.info(`$ ${cmd}`);
+  const result = spawnSync(cmd, {
+    shell: true,
+    stdio: ['inherit', 'pipe', 'pipe'],
+    env: { ...process.env, ...options.env },
+    cwd: options.cwd || process.cwd(),
+    timeout: options.timeout || 300000,
+  });
+
+  const stdout = result.stdout ? result.stdout.toString() : '';
+  const stderr = result.stderr ? result.stderr.toString() : '';
+
+  if (stdout) process.stdout.write(stdout);
+  if (stderr) process.stderr.write(stderr);
+
+  if (result.status !== 0) {
+    throw new Error(
+      `Command failed (exit ${result.status}): ${cmd}\nstderr: ${stderr}`
+    );
+  }
+  return stdout.trim();
+}
+
+// ---------------------------------------------------------------------------
+// Utility: sleep
+// ---------------------------------------------------------------------------
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ---------------------------------------------------------------------------
+// Utility: Write NEAR credentials file so near-cli can authenticate
+// ---------------------------------------------------------------------------
+function writeCredentials(accountId, privateKeyStr, publicKeyStr) {
+  const nearDir = path.join(os.homedir(), '.near-credentials', 'testnet');
+  fs.mkdirSync(nearDir, { recursive: true });
+
+  const credFile = path.join(nearDir, `${accountId}.json`);
+  const cred = {
+    account_id: accountId,
+    public_key: publicKeyStr,
+    private_key: privateKeyStr,
+  };
+  fs.writeFileSync(credFile, JSON.stringify(cred, null, 2), { mode: 0o600 });
+  core.info(`Credentials written to ${credFile}`);
+  return credFile;
+}
+
+// ---------------------------------------------------------------------------
+// STEP 1: Install near-cli at requested version
+// ---------------------------------------------------------------------------
+async function stepInstallNearCli(nearCliVersion) {
+  core.startGroup('Step 1: Install NEAR CLI');
+  try {
+    const versionArg =
+      nearCliVersion === 'latest' ? 'near-cli' : `near-cli@${nearCliVersion}`;
+    core.info(`Installing ${versionArg} globally…`);
+    exec(`npm install -g ${versionArg}`);
+
+    const version = exec('near --version');
+    core.info(`NEAR CLI installed: ${version}`);
+    return version;
+  } finally {
+    core.endGroup();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// STEP 2: Check whether the account already exists on testnet
+// ---------------------------------------------------------------------------
+async function stepCheckAccountExists(accountId) {
+  core.startGroup(`Step 2: Check account existence — ${accountId}`);
+  try {
+    core.info(`Querying RPC for account: ${accountId}`);
     try {
-      const newBalResp = await nearRpcCall(network, 'query', {
+      const result = await nearRpc('query', {
         request_type: 'view_account',
         finality: 'final',
         account_id: accountId,
       });
-      if (newBalResp.body && newBalResp.body.result) {
-        balanceAfter = BigInt(newBalResp.body.result.amount);
-        const afterNEAR = Number(balanceAfter / BigInt('1000000000000000000000000'));
-        core.info(`New balance: ~${afterNEAR} NEAR`);
+      core.info(`Account exists. Balance: ${result.amount} yoctoNEAR`);
+      return true;
+    } catch (e) {
+      if (
+        e.message.includes('does not exist') ||
+        e.message.includes('UNKNOWN_ACCOUNT') ||
+        e.message.includes('unknown account')
+      ) {
+        core.info('Account does not exist yet — will create it.');
+        return false;
       }
-    } catch {
-      // non-critical
+      throw e;
     }
-  } else {
-    core.warning('All faucet attempts failed. Continuing — account may already have sufficient funds.');
-    funded = true; // proceed optimistically
+  } finally {
+    core.endGroup();
   }
-
-  const beforeNEAR = Number(balanceBefore / BigInt('1000000000000000000000000'));
-  const afterNEAR = Number(balanceAfter / BigInt('1000000000000000000000000'));
-
-  core.endGroup();
-  return { funded, balanceBefore: beforeNEAR, balanceAfter: afterNEAR };
 }
 
-// ─── Step 3: Build & Deploy Contract ─────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// STEP 3: Create testnet account via helper contract (faucet)
+// ---------------------------------------------------------------------------
+async function stepCreateAccount(accountId, publicKeyStr) {
+  core.startGroup(`Step 3: Create testnet account — ${accountId}`);
+  try {
+    // NEAR testnet helper endpoint for account creation
+    const HELPER_URL = 'https://helper.testnet.near.org';
+    const body = {
+      newAccountId: accountId,
+      newAccountPublicKey: publicKeyStr,
+    };
 
-async function buildAndDeployContract(contractPath, accountId, privateKey, network) {
-  core.startGroup('Step 3: Build & Deploy Contract');
+    core.info(
+      `Requesting account creation from helper with public key: ${publicKeyStr}`
+    );
+    const res = await request(
+      `${HELPER_URL}/account`,
+      { method: 'POST' },
+      body
+    );
 
-  const resolvedPath = path.resolve(contractPath);
-  core.info(`Contract path: ${resolvedPath}`);
+    core.info(`Helper response status: ${res.status}`);
+    core.info(`Helper response body: ${res.body}`);
 
-  if (!fs.existsSync(resolvedPath)) {
-    throw new Error(`Contract path does not exist: ${resolvedPath}`);
-  }
-
-  // ── 3a. Install near-cli if not present ──────────────────────────────────
-  core.info('Checking for near-cli...');
-  const nearCliCheck = execCommand('near --version');
-  if (!nearCliCheck.success) {
-    core.info('near-cli not found. Installing...');
-    const installResult = execCommand('npm install -g near-cli');
-    if (!installResult.success) {
-      throw new Error(`Failed to install near-cli: ${installResult.error}`);
+    if (res.status === 200 || res.status === 201) {
+      core.info(`Account ${accountId} created successfully.`);
+      // Wait for account to be indexed
+      await sleep(5000);
+      return true;
     }
-    core.info('✅ near-cli installed.');
-  } else {
-    core.info(`✅ near-cli found: ${nearCliCheck.output}`);
+
+    // Some helper versions return 204
+    if (res.status === 204) {
+      core.info(`Account ${accountId} created (204 No Content).`);
+      await sleep(5000);
+      return true;
+    }
+
+    throw new Error(
+      `Account creation failed. HTTP ${res.status}: ${res.body}`
+    );
+  } finally {
+    core.endGroup();
   }
+}
 
-  // ── 3b. Detect contract type and build ───────────────────────────────────
-  const isDirectory = fs.statSync(resolvedPath).isDirectory();
-  let wasmPath = null;
+// ---------------------------------------------------------------------------
+// STEP 4: Request faucet funding
+// ---------------------------------------------------------------------------
+async function stepRequestFunding(accountId, publicKeyStr, faucetAmountNear) {
+  core.startGroup(`Step 4: Request faucet funding — ${faucetAmountNear} NEAR`);
+  try {
+    // Primary: NEAR testnet faucet
+    const FAUCET_URL = 'https://helper.testnet.near.org';
 
-  if (isDirectory) {
-    const files = fs.readdirSync(resolvedPath);
-    core.info(`Directory contents: ${files.join(', ')}`);
+    // Convert NEAR to yoctoNEAR for display (faucet typically sends a fixed amount)
+    const amountFloat = parseFloat(faucetAmountNear);
+    if (isNaN(amountFloat) || amountFloat <= 0) {
+      throw new Error(`Invalid faucet_amount: ${faucetAmountNear}`);
+    }
 
-    const hasCargoToml = files.includes('Cargo.toml');
-    const hasPackageJson = files.includes('package.json');
+    core.info(
+      `Requesting ${amountFloat} NEAR for account ${accountId} from ${FAUCET_URL}`
+    );
 
-    if (hasCargoToml) {
-      // Rust / WASM contract
-      core.info('Detected Rust contract. Building with cargo...');
+    // The NEAR testnet helper /account endpoint already funds the account;
+    // for additional funding we call the faucet endpoint.
+    const body = {
+      account_id: accountId,
+      public_key: publicKeyStr,
+      amount: String(amountFloat),
+    };
 
-      // Ensure rust wasm target
-      const rustupResult = execCommand('rustup target add wasm32-unknown-unknown');
-      if (!rustupResult.success) {
-        core.warning(`rustup target add failed: ${rustupResult.error}`);
-      }
+    const res = await request(
+      `${FAUCET_URL}/account/fund`,
+      { method: 'POST' },
+      body
+    );
 
-      // Try cargo-near first
-      const cargoNearCheck = execCommand('cargo near --version');
-      if (cargoNearCheck.success) {
-        core.info('Using cargo-near to build...');
-        const buildResult = await execCommandAsync('cargo near build --no-docker', { cwd: resolvedPath });
-        if (!buildResult.success) {
-          core.warning(`cargo-near build failed: ${buildResult.error}. Falling back to cargo build...`);
-        } else {
-          core.info('✅ cargo-near build succeeded.');
-        }
-      }
+    core.info(`Faucet response status: ${res.status}`);
+    core.info(`Faucet response body: ${res.body}`);
 
-      // Standard cargo build
-      const cargoBuild = await execCommandAsync(
-        'cargo build --target wasm32-unknown-unknown --release',
-        { cwd: resolvedPath }
+    // Faucet may not support additional top-up beyond initial balance;
+    // treat 4xx as a warning (account was already funded during creation)
+    if (res.status >= 200 && res.status < 300) {
+      core.info('Faucet funding request accepted.');
+    } else if (res.status === 400 || res.status === 404) {
+      core.warning(
+        `Faucet returned ${res.status} — account may already be funded. Continuing.`
       );
+    } else if (res.status === 500) {
+      core.warning(
+        `Faucet returned 500 — endpoint may not support top-up. Continuing with existing balance.`
+      );
+    } else {
+      throw new Error(`Faucet request failed. HTTP ${res.status}: ${res.body}`);
+    }
 
-      if (!cargoBuild.success) {
-        throw new Error(`Rust build failed:\n${cargoBuild.error}`);
-      }
+    // Verify balance after funding attempt
+    await sleep(3000);
+    const accountState = await nearRpc('query', {
+      request_type: 'view_account',
+      finality: 'final',
+      account_id: accountId,
+    });
 
-      // Find the built wasm
-      const wasmDir = path.join(resolvedPath, 'target', 'wasm32-unknown-unknown', 'release');
-      if (fs.existsSync(wasmDir)) {
-        const wasmFiles = fs.readdirSync(wasmDir).filter(f => f.endsWith('.wasm'));
-        if (wasmFiles.length > 0) {
-          wasmPath = path.join(wasmDir, wasmFiles[0]);
-          core.info(`Found WASM: ${wasmPath} (${(fs.statSync(wasmPath).size / 1024).toFixed(1)} KB)`);
-        }
-      }
+    const balanceYocto = BigInt(accountState.amount);
+    const balanceNear = Number(balanceYocto) / 1e24;
+    core.info(`Current balance: ${balanceNear.toFixed(4)} NEAR`);
+    return balanceNear;
+  } finally {
+    core.endGroup();
+  }
+}
 
-      // Also check res/ folder (common pattern)
-      const resDir = path.join(resolvedPath, 'res');
-      if (!wasmPath && fs.existsSync(resDir)) {
-        const resWasms = fs.readdirSync(resDir).filter(f => f.endsWith('.wasm'));
-        if (resWasms.length > 0) {
-          wasmPath = path.join(resDir, resWasms[0]);
-          core.info(`Found WASM in res/: ${wasmPath}`);
-        }
-      }
+// ---------------------------------------------------------------------------
+// STEP 5: Locate and/or build the WASM contract
+// ---------------------------------------------------------------------------
+async function stepPrepareContract(contractPath) {
+  core.startGroup('Step 5: Prepare contract for deployment');
+  try {
+    const resolved = path.resolve(contractPath);
+    core.info(`Contract path (resolved): ${resolved}`);
 
-      if (!wasmPath) {
-        throw new Error('Build completed but no .wasm file found in expected locations.');
-      }
+    if (!fs.existsSync(resolved)) {
+      throw new Error(`Contract path does not exist: ${resolved}`);
+    }
 
-    } else if (hasPackageJson) {
-      // JS/TS contract (AssemblyScript or near-sdk-js)
-      core.info('Detected JS/TS contract. Installing dependencies...');
+    const stat = fs.statSync(resolved);
 
-      const npmInstall = await execCommandAsync('npm install', { cwd: resolvedPath });
-      if (!npmInstall.success) {
-        throw new Error(`npm install failed:\n${npmInstall.error}`);
-      }
+    // If it's already a .wasm file, use it directly
+    if (stat.isFile() && resolved.endsWith('.wasm')) {
+      core.info(`Using pre-compiled WASM: ${resolved}`);
+      return resolved;
+    }
 
-      // Check for build script
-      const pkgJson = JSON.parse(fs.readFileSync(path.join(resolvedPath, 'package.json'), 'utf8'));
-      const buildScript = pkgJson.scripts && (pkgJson.scripts.build || pkgJson.scripts['build:contract']);
+    // If it's a directory, look for existing WASM or attempt build
+    if (stat.isDirectory()) {
+      // Check common output locations
+      const candidates = [
+        path.join(resolved, 'res'),
+        path.join(resolved, 'out'),
+        path.join(resolved, 'target', 'wasm32-unknown-unknown', 'release'),
+        path.join(resolved, 'build'),
+      ];
 
-      if (buildScript) {
-        core.info(`Running build script: ${buildScript}`);
-        const buildResult = await execCommandAsync('npm run build', { cwd: resolvedPath });
-        if (!buildResult.success) {
-          throw new Error(`npm build failed:\n${buildResult.error}`);
-        }
-      }
-
-      // Find wasm output
-      const searchDirs = ['build', 'out', 'res', 'target', '.'];
-      for (const dir of searchDirs) {
-        const searchDir = path.join(resolvedPath, dir);
-        if (fs.existsSync(searchDir)) {
-          const wasmFiles = fs.readdirSync(searchDir).filter(f => f.endsWith('.wasm'));
+      for (const dir of candidates) {
+        if (fs.existsSync(dir)) {
+          const wasmFiles = fs
+            .readdirSync(dir)
+            .filter((f) => f.endsWith('.wasm'));
           if (wasmFiles.length > 0) {
-            wasmPath = path.join(searchDir, wasmFiles[0]);
-            core.info(`Found WASM: ${wasmPath}`);
-            break;
+            const wasmPath = path.join(dir, wasmFiles[0]);
+            core.info(`Found existing WASM: ${wasmPath}`);
+            return wasmPath;
           }
         }
       }
 
-      if (!wasmPath) {
-        throw new Error('No .wasm file found after build. Check your build configuration.');
-      }
-    } else {
-      // Look for pre-built wasm in the directory
-      core.info('Looking for pre-built .wasm file in directory...');
-      const wasmFiles = files.filter(f => f.endsWith('.wasm'));
-      if (wasmFiles.length > 0) {
-        wasmPath = path.join(resolvedPath, wasmFiles[0]);
-        core.info(`Found pre-built WASM: ${wasmPath}`);
-      } else {
-        throw new Error(`No supported contract format detected in ${resolvedPath}. Expected Cargo.toml, package.json, or .wasm file.`);
-      }
-    }
-  } else {
-    // Direct file path
-    if (resolvedPath.endsWith('.wasm')) {
-      wasmPath = resolvedPath;
-      core.info(`Using pre-built WASM: ${wasmPath}`);
-    } else {
-      throw new Error(`Unsupported file type: ${resolvedPath}. Expected .wasm file or contract directory.`);
-    }
-  }
+      // Try to build — detect project type
+      const pkgJson = path.join(resolved, 'package.json');
+      const cargoToml = path.join(resolved, 'Cargo.toml');
 
-  core.info(`WASM size: ${(fs.statSync(wasmPath).size / 1024).toFixed(2)} KB`);
+      if (fs.existsSync(pkgJson)) {
+        core.info('Detected Node.js/AssemblyScript project — running npm install && npm run build');
+        exec('npm install', { cwd: resolved });
+        exec('npm run build', { cwd: resolved });
 
-  // ── 3c. Set up credentials ───────────────────────────────────────────────
-  core.info('Setting up NEAR credentials...');
-  const credentialsDir = path.join(process.env.HOME || '/root', '.near-credentials', network);
-  fs.mkdirSync(credentialsDir, { recursive: true });
-
-  // Derive public key
-  let publicKey = '';
-  try {
-    const keyDerive = execCommand(`node -e "
-const { KeyPair } = require('near-api-js');
-try {
-  const kp = KeyPair.fromString(process.argv[1]);
-  console.log(kp.getPublicKey().toString());
-} catch(e) { process.exit(1); }
-" "${privateKey}"`);
-
-    if (keyDerive.success) {
-      publicKey = keyDerive.output.trim();
-    }
-  } catch {
-    // fallback
-  }
-
-  if (!publicKey) {
-    // Try to extract from the key directly (ed25519 keys)
-    if (privateKey.includes(':')) {
-      const parts = privateKey.split(':');
-      publicKey = `ed25519:${parts[1] ? parts[1].substring(0, 44) : parts[0]}`;
-    } else {
-      publicKey = `ed25519:${privateKey.substring(0, 44)}`;
-    }
-  }
-
-  const credentials = {
-    account_id: accountId,
-    public_key: publicKey,
-    private_key: privateKey,
-  };
-
-  const credFile = path.join(credentialsDir, `${accountId}.json`);
-  fs.writeFileSync(credFile, JSON.stringify(credentials, null, 2));
-  core.info(`✅ Credentials written to ${credFile}`);
-
-  // ── 3d. Deploy via near-cli ──────────────────────────────────────────────
-  core.info(`Deploying ${wasmPath} to ${accountId} on ${network}...`);
-
-  const deployCmd = [
-    'near deploy',
-    `--accountId ${accountId}`,
-    `--wasmFile "${wasmPath}"`,
-    `--networkId ${network}`,
-    `--keyPath "${credFile}"`,
-    '--force',
-  ].join(' ');
-
-  const deployResult = await execCommandAsync(deployCmd);
-
-  if (!deployResult.success) {
-    // Try with environment variable approach
-    core.warning(`near deploy failed: ${deployResult.error}`);
-    core.info('Retrying with NEAR_ENV environment variable...');
-
-    const deployResult2 = await execCommandAsync(
-      `near deploy --accountId ${accountId} --wasmFile "${wasmPath}" --force`,
-      {
-        env: {
-          ...process.env,
-          NEAR_ENV: network,
-          NEAR_CREDENTIALS_DIR: path.join(process.env.HOME || '/root', '.near-credentials'),
+        // Re-scan after build
+        for (const dir of candidates) {
+          if (fs.existsSync(dir)) {
+            const wasmFiles = fs
+              .readdirSync(dir)
+              .filter((f) => f.endsWith('.wasm'));
+            if (wasmFiles.length > 0) {
+              const wasmPath = path.join(dir, wasmFiles[0]);
+              core.info(`Built WASM: ${wasmPath}`);
+              return wasmPath;
+            }
+          }
+        }
+      } else if (fs.existsSync(cargoToml)) {
+        core.info('Detected Rust project — running cargo build --release (wasm32 target)');
+        // Ensure wasm target is present
+        try {
+          exec('rustup target add wasm32-unknown-unknown');
+        } catch (_) {
+          core.warning('Could not add wasm32 target — it may already be present.');
+        }
+        exec('cargo build --target wasm32-unknown-unknown --release', {
+          cwd: resolved,
+        });
+        const releaseDir = path.join(
+          resolved,
+          'target',
+          'wasm32-unknown-unknown',
+          'release'
+        );
+        if (fs.existsSync(releaseDir)) {
+          const wasmFiles = fs
+            .readdirSync(releaseDir)
+            .filter((f) => f.endsWith('.wasm') && !f.endsWith('.d.wasm'));
+          if (wasmFiles.length > 0) {
+            const wasmPath = path.join(releaseDir, wasmFiles[0]);
+            core.info(`Built WASM: ${wasmPath}`);
+            return wasmPath;
+          }
         }
       }
+
+      throw new Error(
+        `No WASM file found in ${resolved} and could not determine how to build it. ` +
+          'Please provide a path directly to a .wasm file, or ensure your build produces a .wasm in a standard location.'
+      );
+    }
+
+    throw new Error(
+      `contract_path must be a .wasm file or a project directory. Got: ${resolved}`
+    );
+  } finally {
+    core.endGroup();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// STEP 6: Deploy the contract using near-cli
+// ---------------------------------------------------------------------------
+async function stepDeployContract(accountId, wasmPath, privateKeyStr) {
+  core.startGroup(`Step 6: Deploy contract — ${path.basename(wasmPath)}`);
+  try {
+    if (!fs.existsSync(wasmPath)) {
+      throw new Error(`WASM file not found at deploy time: ${wasmPath}`);
+    }
+
+    const wasmSize = fs.statSync(wasmPath).size;
+    core.info(`WASM size: ${(wasmSize / 1024).toFixed(2)} KB`);
+
+    // near-cli reads credentials from ~/.near-credentials/testnet/<accountId>.json
+    // which we wrote in writeCredentials() earlier.
+    const deployCmd = [
+      'near deploy',
+      `--accountId ${accountId}`,
+      `--wasmFile ${wasmPath}`,
+      '--networkId testnet',
+      '--nodeUrl https://rpc.testnet.near.org',
+    ].join(' ');
+
+    const output = exec(deployCmd, {
+      env: { ...process.env, NEAR_ENV: 'testnet' },
+    });
+
+    core.info('Deploy output:');
+    core.info(output);
+
+    // Extract transaction hash from near-cli output
+    const txHashMatch = output.match(/Transaction Id ([A-Za-z0-9]+)/);
+    const txHash = txHashMatch ? txHashMatch[1] : null;
+
+    if (txHash) {
+      core.info(`Deploy transaction hash: ${txHash}`);
+    } else {
+      core.warning('Could not extract transaction hash from deploy output.');
+    }
+
+    // Verify deployment by checking contract code on-chain
+    core.info('Verifying deployment on-chain…');
+    await sleep(3000);
+    const codeResult = await nearRpc('query', {
+      request_type: 'view_code',
+      finality: 'final',
+      account_id: accountId,
+    });
+
+    if (!codeResult || !codeResult.code_base64) {
+      throw new Error('Deployment verification failed: no contract code found on-chain.');
+    }
+
+    const deployedBytes = Buffer.from(codeResult.code_base64, 'base64').length;
+    core.info(
+      `Deployment verified. On-chain contract size: ${(deployedBytes / 1024).toFixed(2)} KB`
     );
 
-    if (!deployResult2.success) {
-      throw new Error(`Deployment failed:\n${deployResult2.error || deployResult2.output}`);
-    }
+    return { txHash, deployedBytes };
+  } finally {
+    core.endGroup();
   }
+}
 
-  core.info('✅ Contract deployed successfully!');
-
-  // ── 3e. Verify deployment ────────────────────────────────────────────────
-  core.info('Verifying deployment on-chain...');
-  await new Promise(r => setTimeout(r, 3000));
-
-  let codeHash = 'unknown';
+// ---------------------------------------------------------------------------
+// STEP 7: Run smoke tests
+// ---------------------------------------------------------------------------
+async function stepRunSmokeTests(testCommand, contractPath, accountId) {
+  core.startGroup(`Step 7: Run smoke tests — ${testCommand}`);
   try {
-    const verifyRe
+    // Determine working directory: use contract directory if path is a file,
+    // otherwise use the directory itself.
+    let cwd;
+    const resolved = path.resolve(contractPath);
+    const stat = fs.existsSync(resolved) ? fs.statSync(resolved) : null;
+
+    if (stat && stat.isDirectory()) {
+      cwd = resolved;
+    } else if (stat && stat.isFile()) {
+      cwd = path.dirname(resolved);
+    } else {
+      cwd = process.cwd();
+    }
+
+    core.info(`Test working directory: ${cwd}`);
+    core.info(`Running: ${testCommand}`);
+
+    const testEnv = {
+      ...process.env,
+      NEAR_ENV: 'testnet',
+      NEAR_TESTNET_ACCOUNT: accountId,
+      CONTRACT_ACCOUNT_ID: accountId,
+    };
+
+    // Run the test command; capture output but also stream it
+    const result = spawnSync(testCommand, {
+      shell: true,
+      stdio: ['inherit', 'pipe', 'pipe'],
+      env: testEnv,
+      cwd,
+      timeout: 300000,
+    });
+
+    const stdout = result.stdout ? result.stdout.toString() : '';
+    const stderr = result.stderr ? result.stderr.toString() : '';
+
+    if (stdout) process.stdout.write(stdout);
+    if (stderr) process.stderr.write(stderr);
+
+    if (result.status !== 0) {
+      throw new Error(
+        `Smoke tests failed with exit code ${result.status}.\nstderr: ${stderr}`
+      );
+    }
+
+    core.info('
